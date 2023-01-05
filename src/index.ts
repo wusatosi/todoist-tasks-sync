@@ -9,30 +9,14 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
-import {
-  authenticateFrom,
-  GoogleAuthentication,
-  GoogleTask,
-  GoogleTaskInsert,
-  TaskApi
-} from "./googleHelper";
+import {authenticateFrom, GoogleTaskInsert, TaskApi} from "./googleHelper";
 
 export interface Env {
-  // Example binding to KV. Learn more at
-  // https://developers.cloudflare.com/workers/runtime-apis/kv/ MY_KV_NAMESPACE:
-  // KVNamespace;
   KV: KVNamespace;
+  auth: KVNamespace;
 
   CLIENT_ID: string;
   CLIENT_SECRET: string;
-
-  // Example binding to Durable Object. Learn more at
-  // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-  // MY_DURABLE_OBJECT: DurableObjectNamespace;
-  //
-  // Example binding to R2. Learn more at
-  // https://developers.cloudflare.com/workers/runtime-apis/r2/ MY_BUCKET:
-  // R2Bucket;
 }
 
 interface TodoistDue {
@@ -47,6 +31,7 @@ interface TodoistTask {
   due: TodoistDue|null
   completed_at: string|null
   id: string
+  is_deleted: 0|1;
 }
 
 interface WebhookEvent {
@@ -55,107 +40,120 @@ interface WebhookEvent {
   event_data: TodoistTask
 }
 
-async function todoistHanlderFromAuth(_event: WebhookEvent,
-                                      auth: GoogleAuthentication, env: Env):
-    Promise<TodoistWebHookHandler> {
-  const listId =
-      await env.KV.get("LIST_KEY") || "MDQxNjYxMjg3ODk5NzMwMTM2NzQ6MDow";
-  return new TodoistWebHookHandler(_event, new TaskApi(listId, auth), env);
+function translateTask(model: TodoistTask): GoogleTaskInsert {
+  // TODO: sub tasks
+  const result: GoogleTaskInsert = {
+    title : model.content,
+    notes : model.description,
+  };
+  if (model.due != null) {
+    // Note: We are unable to enforce time of day here.
+    result.due = new Date(model.due.date).toISOString();
+    result.status = "needsAction";
+  }
+  if (model.checked) {
+    result.completed = new Date(model.completed_at || new Date()).toISOString();
+    result.status = "completed";
+  }
+  if (model.is_deleted == 1)
+    result.deleted = true;
+  return result;
 }
 
-class TodoistWebHookHandler {
-  event: WebhookEvent
-  env: Env
-  service: TaskApi
+interface TaskContext {
+  service: TaskApi;
+  env: Env;
+}
 
-  constructor(_event: WebhookEvent, _service: TaskApi, _env: Env) {
-    this.event = _event;
-    this.service = _service;
-    this.env = _env;
+async function createNewTask(model: TodoistTask, context: TaskContext) {
+  const tsk = await context.service.insertTask(translateTask(model));
+  console.debug("created task:", JSON.stringify(tsk));
+  await context.env.KV.put(`mapping:${model.id}`, tsk.id);
+  console.debug("put mapping info");
+}
+
+async function updateTask(model: TodoistTask, googleId: string,
+                          context: TaskContext) {
+  const gtsk = await context.service.updateTask(googleId, translateTask(model))
+  console.debug("updated as: ", gtsk);
+}
+
+async function deleteTask(googleId: string, todoistId: string,
+                          context: TaskContext) {
+  // TODO handle task does not exist (404)
+  await context.service.deleteTask(googleId);
+  console.debug("deleted from google");
+  await context.env.KV.delete(`mapping:${todoistId}`);
+  console.debug("deleted mapping");
+}
+
+async function findValidIdMapping(todoistId: string,
+                                  context: TaskContext): Promise<string|null> {
+  const stored = await context.env.KV.get(`mapping:${todoistId}`);
+  if (stored == null) {
+    console.debug("mapping does not exist in our system");
+    return null;
   }
-
-  translateTask(): GoogleTaskInsert {
-    const eventData = this.event.event_data;
-    const result: GoogleTaskInsert = {
-      title : eventData.content,
-      notes : eventData.description,
-    };
-    if (eventData.due != null) {
-      // Note: We are unable to enforce time of day here.
-      result.due = new Date(eventData.due.date).toISOString();
-      result.status = "needsAction";
-    }
-    if (eventData.checked) {
-      result.completed =
-          new Date(eventData.completed_at || new Date()).toISOString();
-      result.status = "completed";
-    }
-    return result;
-  }
-
-  async createNewGoogleTask() {
-    const tsk = await this.service.insertTask(this.translateTask());
-    console.log(JSON.stringify(tsk));
-    await this.putEventIdMapping(tsk.id);
-  }
-
-  async getTaskListId(): Promise<string> {
-    const result = await this.env.KV.get(`taskList:${this.event.user_id}`);
-    if (result == null)
-      throw "Corupted DB";
-    return result;
-  }
-
-  async putEventIdMapping(mappedToId: string) {
-    const todoistId = this.event.event_data.id;
-    await this.env.KV.put(`mapping:${todoistId}`, mappedToId);
-  }
-
-  async eventIdMapping(): Promise<string|null> {
-    const todoistId = this.event.event_data.id;
-    return await this.env.KV.get(`mapping:${todoistId}`, {type : "text"})
-  }
-
-  async doTranslate(): Promise<void> {
-    console.debug("Event:", this.event);
-    if (this.event.event_name == "item:added") {
-      console.log("creating new task");
-      await this.createNewGoogleTask();
-      return;
-    }
-    const googleId = await this.eventIdMapping();
-    console.debug(
-        `task id translation: ${this.event.event_data.id} -> ${googleId}`);
-    if (this.event.event_name == "item:deleted") {
-      console.log("deleting task");
-      const todoistId = this.event.event_data.id;
-      // TODO handle task does not exist
-      if (googleId) {
-        await this.service.deleteTask(googleId);
-        await this.env.KV.delete(`mapping:${todoistId}`);
-      }
-      return;
-    }
-    if (googleId == null) {
-      console.log("cannot find given task, creating a new one");
-      await this.createNewGoogleTask();
-      return;
-    }
-    console.log("updating task");
-    await this.service.updateTask(googleId, this.translateTask())
+  // TODO: actually determins if it exist
+  try {
+    await context.service.retriveTask(stored);
+    return stored;
+  } catch (_: any) {
+    // TODO: a 404 here means that this mapping is not valid anymore, need to
+    // update.
+    console.debug("stored mapping invalid, treated as creating a new one");
+    return null;
   }
 }
 
-async function handle(request: Request, env: Env): Promise<Response> {
-  const body: WebhookEvent = await request.json();
-  const auth = await authenticateFrom(body.user_id, env);
-  if (auth != null) {
-    console.debug(`found auth info for ${body.user_id}`);
-    await (await todoistHanlderFromAuth(body, auth, env)).doTranslate();
-  } else {
-    console.debug(`todoist user: ${body.user_id} auth not found in our DB`);
+async function handleWebhook(request: Request, env: Env): Promise<Response> {
+  const event: WebhookEvent = await request.json();
+  const auth = await authenticateFrom(event.user_id, env);
+  const response = new Response("", {status : 200});
+
+  if (auth == null) {
+    console.log(`todoist user: ${event.user_id} auth not found in our DB`);
+    return response;
   }
-  return new Response("", {status : 200});
+
+  console.debug(`found auth info for ${event.user_id}`);
+  // TODO: lookup listId
+  const service = new TaskApi("MDQxNjYxMjg3ODk5NzMwMTM2NzQ6MDow", auth);
+  console.debug("Event:", event);
+
+  const context: TaskContext = {service : service, env : env};
+  const model = event.event_data;
+  const todoistId = model.id;
+
+  if (event.event_name == "item:added") {
+    console.log("creating new task");
+    await createNewTask(model, context)
+    return response;
+  }
+
+  const googleId = await findValidIdMapping(todoistId, context);
+  console.debug(`task id translation: ${todoistId} -> ${googleId}`);
+
+  if (event.event_name == "item:deleted") {
+    if (googleId) {
+      console.log("task in our sys, deleting task");
+      deleteTask(googleId, todoistId, context);
+    } else {
+      console.log("cannot find mapped task, ignored");
+    }
+    return response;
+  }
+
+  if (googleId == null) {
+    console.log("cannot find given task, creating a new one");
+    await createNewTask(model, context)
+    return response;
+  }
+
+  console.log("updating task");
+  await updateTask(model, googleId, context);
+
+  return response;
 }
 
 function isTodoistRoute(request: Request): boolean {
@@ -170,7 +168,7 @@ export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext):
       Promise<Response> {
         if (isTodoistRoute(request))
-          return handle(request, env);
+          return handleWebhook(request, env);
         else
           return new Response(
               'Not found',

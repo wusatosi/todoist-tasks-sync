@@ -18,8 +18,8 @@ interface RefreshTokenResponse {
   // token type
 }
 
-async function authenticateFrom(todoistUserId: string,
-                                env: Env): Promise<GoogleAuthentication|null> {
+export async function authenticateFrom(todoistUserId: string, env: Env):
+    Promise<GoogleAuthentication|null> {
   const accessToken = await env.KV.get(`access-token:${todoistUserId}`);
   if (accessToken) {
     console.log("Obtained authentication token from cache");
@@ -56,7 +56,8 @@ async function authenticateFrom(todoistUserId: string,
   });
 
   if (!response.ok) {
-    console.error("Cannot obtain refresh token", response.status);
+    console.error("Cannot obtain refresh token", response.status,
+                  await response.text());
     return null;
   }
 
@@ -64,7 +65,7 @@ async function authenticateFrom(todoistUserId: string,
   env.KV.put(`access-token:${todoistUserId}`, ack.access_token,
              {expirationTtl : ack.expires_in})
 
-  console.log("Obtained authentication token from refresh token");
+  console.log("obtained authentication token from refresh token");
   return new GoogleAuthentication(ack.access_token);
 }
 
@@ -133,13 +134,8 @@ export class TaskApi {
   }
 
   private async handleResponse(fetchResponse: Response): Promise<GoogleTask> {
-    if (fetchResponse.ok) {
-      const response: GoogleTask = await fetchResponse.json();
-      console.log(JSON.stringify(response));
-      return response;
-    } else {
-      return await this.handleFailedResponse(fetchResponse);
-    }
+    return fetchResponse.ok ? await fetchResponse.json()
+                            : await this.handleFailedResponse(fetchResponse);
   }
 
   async retriveTask(taskId: string): Promise<GoogleTask> {
@@ -171,9 +167,6 @@ export class TaskApi {
     const fetchResponse = await fetch(
         url, this.auth.signRequest(
                  {method : "POST", body : JSON.stringify(content)}));
-    console.log(JSON.stringify(content));
     return this.handleResponse(fetchResponse);
   }
 }
-
-export {authenticateFrom};
