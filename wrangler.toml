@@ -1,9 +1,9 @@
 name = "tasks"
 main = "src/index.ts"
 compatibility_date = "2022-12-15"
-node_compat = true
+# node_compat = true
 
 kv_namespaces = [
-  { binding = "KV", id = "d4061ae254f24ba5bdd42e5b1efa2a7c" }
+  { binding = "KV", id = "d4d81041691340a3a4cb07160c32565b", preview_id = "d53236f3eccb42e2943cdd1e8033400e" }
 ]
 
