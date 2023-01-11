@@ -159,6 +159,7 @@ export class TaskApi {
         await fetch(this.urlOf(taskId), this.auth.signRequest());
     if (!fetchResponse.ok)
       await this.handleFailedResponse(fetchResponse);
+    console.log("response", await fetchResponse.text())
   }
 
   async insertTask(content: GoogleTaskInsert): Promise<GoogleTask> {

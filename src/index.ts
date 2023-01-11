@@ -1,19 +1,8 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `wrangler dev src/index.ts` in your terminal to start a development
- * server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `wrangler publish src/index.ts --name my-worker` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-
 import {authenticateFrom, GoogleTaskInsert, TaskApi} from "./googleHelper";
 
 export interface Env {
   KV: KVNamespace;
-  auth: KVNamespace;
+  mapping: KVNamespace;
 
   CLIENT_ID: string;
   CLIENT_SECRET: string;
@@ -65,10 +54,12 @@ interface TaskContext {
   env: Env;
 }
 
+const TOMB_STONE = "__DELETED"
+
 async function createNewTask(model: TodoistTask, context: TaskContext) {
   const tsk = await context.service.insertTask(translateTask(model));
   console.debug("created task:", JSON.stringify(tsk));
-  await context.env.KV.put(`mapping:${model.id}`, tsk.id);
+  await putMapping(model.id, tsk.id, context)
   console.debug("put mapping info");
 }
 
@@ -80,30 +71,32 @@ async function updateTask(model: TodoistTask, googleId: string,
 
 async function deleteTask(googleId: string, todoistId: string,
                           context: TaskContext) {
-  // TODO handle task does not exist (404)
+  // TODO handle task does not exist (404?)
   await context.service.deleteTask(googleId);
   console.debug("deleted from google");
-  await context.env.KV.delete(`mapping:${todoistId}`);
+  await markMappingForDeletion(todoistId, context);
   console.debug("deleted mapping");
 }
 
-async function findValidIdMapping(todoistId: string,
-                                  context: TaskContext): Promise<string|null> {
-  const stored = await context.env.KV.get(`mapping:${todoistId}`);
-  if (stored == null) {
+async function markMappingForDeletion(todoistId: string, context: TaskContext) {
+  const HOUR = 60 * 60;
+  await context.env.mapping.put(todoistId, TOMB_STONE, {expirationTtl : HOUR});
+  console.debug("Tomb stone marked for " + todoistId);
+}
+
+async function putMapping(todoistId: string, googleId: string,
+                          context: TaskContext) {
+  await context.env.mapping.put(todoistId, googleId);
+}
+
+async function findMapping(todoistId: string,
+                           context: TaskContext): Promise<string|null> {
+  const mapping = await context.env.mapping.get(todoistId);
+  if (mapping == null) {
     console.debug("mapping does not exist in our system");
     return null;
   }
-  // TODO: actually determins if it exist
-  try {
-    await context.service.retriveTask(stored);
-    return stored;
-  } catch (_: any) {
-    // TODO: a 404 here means that this mapping is not valid anymore, need to
-    // update.
-    console.debug("stored mapping invalid, treated as creating a new one");
-    return null;
-  }
+  return mapping;
 }
 
 async function handleWebhook(request: Request, env: Env): Promise<Response> {
@@ -131,13 +124,18 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
     return response;
   }
 
-  const googleId = await findValidIdMapping(todoistId, context);
+  const googleId = await findMapping(todoistId, context);
   console.debug(`task id translation: ${todoistId} -> ${googleId}`);
+  if (googleId == TOMB_STONE) {
+    // This means the events came out of order, and the original is deleted.
+    console.log("event tomb-stoned, ignored");
+    return response;
+  }
 
   if (event.event_name == "item:deleted") {
     if (googleId) {
       console.log("task in our sys, deleting task");
-      deleteTask(googleId, todoistId, context);
+      await deleteTask(googleId, todoistId, context);
     } else {
       console.log("cannot find mapped task, ignored");
     }
@@ -156,7 +154,7 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
   return response;
 }
 
-function isTodoistRoute(request: Request): boolean {
+function isWebhookRoute(request: Request): boolean {
   const ctype = request.headers.get("content-type") || "";
   const url = new URL(request.url);
   // TODO: check x-app-id?
@@ -165,9 +163,10 @@ function isTodoistRoute(request: Request): boolean {
 }
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext):
+  async fetch(request: Request, env: Env, _: ExecutionContext):
       Promise<Response> {
-        if (isTodoistRoute(request))
+        console.log("incoming request", request.method, request.url);
+        if (isWebhookRoute(request))
           return handleWebhook(request, env);
         else
           return new Response(

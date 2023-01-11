@@ -4,6 +4,7 @@ compatibility_date = "2022-12-15"
 # node_compat = true
 
 kv_namespaces = [
-  { binding = "KV", id = "d4d81041691340a3a4cb07160c32565b", preview_id = "d53236f3eccb42e2943cdd1e8033400e" }
+  { binding = "KV", id = "d4d81041691340a3a4cb07160c32565b", preview_id = "d53236f3eccb42e2943cdd1e8033400e" },
+  { binding = "mapping", id = "41ccdf46fac34869a317d1655b36df10", preview_id = "33efa447530f4819bd05b78e61348f15" }
 ]
 
